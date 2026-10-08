@@ -159,7 +159,8 @@
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
         <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
+          <a href="https://github.com/mussonking/Phobos" target="_blank" rel="noopener noreferrer">Phobos on GitHub</a>
+          (a fork of <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a>)</p>
       </div>
     </div>
   </section>
@@ -178,16 +179,18 @@
         <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
       </div>
     </div>
-    <div class="st-field">
+    <p class="muted small" id="greedy-note" hidden>This engine always takes the most likely word (greedy): the same
+      question gives the same answer. Temperature, top-p, top-k and seed don't apply.</p>
+    <div class="st-field" id="f-temp">
       <label class="st-label" for="s-temp">Temperature <output id="o-temp"></output></label>
       <input class="st-slider" type="range" id="s-temp" min="0" max="1.5" step="0.05">
       <span class="muted small">0 = always the most likely word (exact, repeatable)</span>
     </div>
-    <div class="st-field">
+    <div class="st-field" id="f-topp">
       <label class="st-label" for="s-topp">Top-p <output id="o-topp"></output></label>
       <input class="st-slider" type="range" id="s-topp" min="0.05" max="1" step="0.05">
     </div>
-    <div class="st-field">
+    <div class="st-field" id="f-topk">
       <label class="st-label" for="s-topk">Top-k <output id="o-topk"></output></label>
       <input class="st-slider" type="range" id="s-topk" min="1" max="64" step="1">
     </div>
@@ -195,7 +198,7 @@
       <label class="st-label" for="s-max">Max tokens <output>empty = until done</output></label>
       <input class="st-input" id="s-max" type="number" min="1" step="1" placeholder="Until done">
     </div>
-    <div class="st-field">
+    <div class="st-field" id="f-seed">
       <label class="st-label" for="s-seed">Seed <output>empty = random</output></label>
       <input class="st-input" id="s-seed" type="number" min="1" step="1" placeholder="Random">
     </div>

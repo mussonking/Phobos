@@ -1,0 +1,30 @@
+{# Minimal family fallback. The GGUF's exported chat_template.jinja takes precedence when present. #}
+{%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'Max' -%}
+[gMASK]<sop><|system|>Reasoning Effort: {{ effort|capitalize }}
+{%- for message in messages if message.role in ['system', 'developer'] -%}
+<|system|>{{ message.content }}
+{%- endfor -%}
+{%- if tools -%}
+<|system|># Tools
+<tools>
+{%- for tool in tools -%}
+{%- if tool.function is defined -%}{%- set tool = tool.function -%}{%- endif -%}
+{{ tool|tojson(ensure_ascii=False) }}
+{%- endfor -%}
+</tools>
+For each function call, output <tool_call>NAME<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>.
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'user' -%}
+<|user|>{{ message.content }}
+{%- elif message.role == 'assistant' -%}
+<|assistant|><think>{{ message.reasoning_content|default('', true) }}</think>{{ message.content|default('', true) }}
+{%- for tool_call in message.tool_calls|default([], true) -%}
+{%- if tool_call.function is defined -%}{%- set tool_call = tool_call.function -%}{%- endif -%}
+<tool_call>{{ tool_call.name }}{%- for key, value in tool_call.arguments|default({}, true)|items -%}<arg_key>{{ key }}</arg_key><arg_value>{{ value|tojson(ensure_ascii=False) if value is not string else value }}</arg_value>{%- endfor -%}</tool_call>
+{%- endfor -%}
+{%- elif message.role == 'tool' -%}
+{%- if loop.first or messages[loop.index0 - 1].role != 'tool' -%}<|observation|>{%- endif -%}<tool_response>{{ message.content }}</tool_response>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}

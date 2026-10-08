@@ -64,26 +64,47 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+def effort_kwargs(value, family: str = "qwen") -> dict:
+    """A reasoning effort as given by a client -> the model template's kwargs. Unknown values are a 400."""
     if value is None or value == "":
         return {}
-    if value is False:
-        return {"enable_thinking": False}
-    key = str(value).strip().lower()
+    key = "none" if value is False else str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
     level = EFFORT[key]
+    if family == "glm":
+        # The GLM template's system line accepts only Low and High; absence deliberately keeps its Max default.
+        # It has no switch for disabling its <think> generation prefix, so "none" (thinking off) gets Low, the least
+        # thinking it has (2026-10-06; it used to fall to the default, Max: the opposite of the request).
+        if key in ("max", "maximum"):
+            return {}
+        return {"reasoning_effort": "high" if level in ("medium", "xhigh") else "low"}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
-def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
+def effort_off(value) -> bool:
+    """A client's effort value that asks for no thinking (false, "none", "disabled", ...)."""
+    return value is False or isinstance(value, str) and EFFORT.get(value.strip().lower(), "") is None
+
+
+# The levels a family's template really has, for a client's selector (GET /health "reasoning_efforts"; the web app's
+# Thinking buttons). A family not listed keeps the client's own list (Qwen: none, low, medium, high). "default" is
+# the selector's: GLM's chat defaults to High (Max thinks 2K-8K+ tokens even on a short story, measured 2026-10-06,
+# High answers in 10-40 s); a request that names no effort still gets the template's own default, Max.
+EFFORT_LEVELS = {"glm": {"levels": ["low", "high", "max"], "default": "high"}}
+
+
+def effort_levels(family: str = "qwen") -> dict | None:
+    return EFFORT_LEVELS.get(family)
+
+
+def budget_effort(tokens, family: str = "qwen") -> dict:
+    """Anthropic thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return effort_kwargs("low" if n < 2048 else "medium" if n < 8192 else "high", family)
 
 
 def _has_image(content) -> bool:
@@ -137,7 +158,7 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, family: str = "qwen") -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
     for m in req.get("messages", []):
@@ -154,25 +175,32 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
-                calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
+                call = {"function": {"name": fn.get("name"), "arguments": args or {}}}
+                if c.get("id"):
+                    call["id"] = c["id"]
+                calls.append(call)
             out["tool_calls"] = calls
+        if role == "tool" and m.get("tool_call_id"):
+            out["tool_call_id"] = m["tool_call_id"]
         messages.append(out)
     tools = [t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
              for t in req.get("tools") or []] or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    effort = req.get("reasoning_effort") or reasoning.get("effort")
+    kwargs.update(effort_kwargs(effort, family))
+    off = effort_off(effort)   # thinking off wins over any level (GLM: off is Low, so a later level could override)
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
-            kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+            kwargs, off = effort_kwargs(False, family), True
+        elif k == "reasoning_effort" and not off:
+            kwargs.update(effort_kwargs(v, family))
     return _late_system_to_user(messages), tools, kwargs
 
 
-def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, family: str = "qwen") -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs)."""
     messages = []
     system = req.get("system")
@@ -195,9 +223,15 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
+                call = {"function": {"name": block.get("name"), "arguments": block.get("input") or {}}}
+                if block.get("id"):
+                    call["id"] = block["id"]
+                calls.append(call)
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
+                result = {"role": "tool", "content": _text_of(block.get("content"))}
+                if block.get("tool_use_id"):
+                    result["tool_call_id"] = block["tool_use_id"]
+                messages.append(result)
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:
@@ -213,11 +247,11 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        kwargs["enable_thinking"] = False
+        kwargs.update(effort_kwargs(False, family))
     elif effort:
-        kwargs.update(effort_kwargs(effort))
+        kwargs.update(effort_kwargs(effort, family))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
-        kwargs.update(budget_effort(thinking["budget_tokens"]))
+        kwargs.update(budget_effort(thinking["budget_tokens"], family))
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -482,6 +516,226 @@ class OutputParser:
         if self.buf:
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
+            out.append(Event(kind, text))
+            self.buf = ""
+        return out
+
+
+# GLM-5's tokenizer template uses compact argument tags, not Qwen's function/parameter XML.
+GLM_CALL_START = "<tool_call>"
+GLM_CALL_END = "</tool_call>"
+GLM_ARG_KEY = "<arg_key>"
+GLM_ARG_KEY_END = "</arg_key>"
+GLM_ARG_VALUE = "<arg_value>"
+GLM_ARG_VALUE_END = "</arg_value>"
+
+
+def _glm_argument(value: str, declared_type: str | None):
+    """Decode values emitted by the GLM template: strings are raw; all other JSON values use tojson."""
+    if declared_type == "string":
+        return value
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return value
+
+
+def parse_glm_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+    """Parse `NAME<arg_key>k</arg_key><arg_value>v</arg_value>...` into an OpenAI-style call."""
+    body = body.strip()
+    first = body.find(GLM_ARG_KEY)
+    name = (body if first < 0 else body[:first]).strip()
+    if not name:
+        raise ValueError("malformed GLM tool call: missing function name")
+    rest = "" if first < 0 else body[first:]
+    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    args = {}
+    while rest:
+        rest = rest.lstrip()
+        if not rest:
+            break
+        if not rest.startswith(GLM_ARG_KEY):
+            raise ValueError("malformed GLM tool call near " + rest[:80])
+        rest = rest[len(GLM_ARG_KEY):]
+        key_end = rest.find(GLM_ARG_KEY_END)
+        if key_end < 0:
+            raise ValueError("malformed GLM tool call: missing </arg_key>")
+        key = rest[:key_end]
+        rest = rest[key_end + len(GLM_ARG_KEY_END):].lstrip()
+        if not rest.startswith(GLM_ARG_VALUE):
+            raise ValueError("malformed GLM tool call: missing <arg_value>")
+        rest = rest[len(GLM_ARG_VALUE):]
+        value_end = rest.find(GLM_ARG_VALUE_END)
+        if value_end < 0:
+            raise ValueError("malformed GLM tool call: missing </arg_value>")
+        value = rest[:value_end]
+        rest = rest[value_end + len(GLM_ARG_VALUE_END):]
+        args[key] = _glm_argument(value, (props.get(key) or {}).get("type"))
+    return ToolCall(name=name, arguments=args)
+
+
+class GLMOutputParser:
+    """Incremental parser for GLM's `<tool_call>NAME<arg_key>...` output format.
+
+    Tags may be split at any character boundary. A call is announced once its name is delimited; each complete
+    argument is streamed as valid JSON, and the final event contains the same parsed arguments as non-stream mode.
+    """
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+        self.state = "reasoning" if thinking else "content"
+        self.buf = ""
+        self.lead = False
+        self.schemas = {t.get("name"): t for t in tools or []}
+        self.stream_tools = stream_tools
+        self.call = None
+        self.call_name = ""
+        self.call_args = {}
+        self.call_schemas = {}
+        self.call_has_args = False
+        self._scan_pos = 0
+
+    def _reset_call(self):
+        self.call = None
+        self.call_name = ""
+        self.call_args = {}
+        self.call_schemas = {}
+        self.call_has_args = False
+        self._scan_pos = 0
+
+    def _scan_call(self, body: str, complete: bool = False) -> list[Event]:
+        out = []
+        if self.call is None:
+            boundary = body.find(GLM_ARG_KEY)
+            if boundary < 0 and not complete:
+                return out
+            name = (body if boundary < 0 else body[:boundary]).strip()
+            if not name:
+                raise ValueError("malformed GLM tool call: missing function name")
+            self.call_name = name
+            self.call = ToolCall(name=name, arguments={})
+            props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+            self.call_schemas = {k: (v or {}).get("type") for k, v in props.items()}
+            if self.stream_tools:
+                out.append(Event("tool_start", call=self.call))
+                out.append(Event("tool_args", "{", call=self.call))
+            # If the first key was already found, continue scanning from its opening tag.
+            self._scan_pos = len(body) if boundary < 0 else boundary
+        pos = self._scan_pos
+        while pos < len(body):
+            rest = body[pos:]
+            stripped = rest.lstrip()
+            pos += len(rest) - len(stripped)
+            if not stripped:
+                break
+            if not stripped.startswith(GLM_ARG_KEY):
+                # A partial opening tag can arrive split across token deltas.
+                if not complete and GLM_ARG_KEY.startswith(stripped):
+                    break
+                if complete:
+                    raise ValueError("malformed GLM tool call near " + stripped[:80])
+                break
+            key_pos = pos
+            pos += len(GLM_ARG_KEY)
+            key_end = body.find(GLM_ARG_KEY_END, pos)
+            if key_end < 0:
+                pos = key_pos
+                break
+            key = body[pos:key_end]
+            pos = key_end + len(GLM_ARG_KEY_END)
+            rest = body[pos:]
+            stripped = rest.lstrip()
+            pos += len(rest) - len(stripped)
+            if not stripped.startswith(GLM_ARG_VALUE):
+                if not complete and GLM_ARG_VALUE.startswith(stripped):
+                    pos = key_pos
+                    break
+                if complete:
+                    raise ValueError("malformed GLM tool call: missing <arg_value>")
+                pos = key_pos
+                break
+            pos += len(GLM_ARG_VALUE)
+            value_end = body.find(GLM_ARG_VALUE_END, pos)
+            if value_end < 0:
+                pos = key_pos
+                break
+            value = body[pos:value_end]
+            parsed = _glm_argument(value, self.call_schemas.get(key))
+            prefix = "," if self.call_has_args else ""
+            self.call_has_args = True
+            self.call_args[key] = parsed
+            if self.stream_tools:
+                piece = prefix + json.dumps(key, ensure_ascii=False) + ":" + json.dumps(parsed, ensure_ascii=False)
+                out.append(Event("tool_args", piece, call=self.call))
+            pos = value_end + len(GLM_ARG_VALUE_END)
+        self._scan_pos = pos
+        return out
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out = []
+        while True:
+            if self.state == "reasoning":
+                i = self.buf.find(THINK_END)
+                if i < 0:
+                    keep = OutputParser._hold(self, self.buf, (THINK_END,))
+                    if len(self.buf) > keep:
+                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        self.buf = self.buf[len(self.buf) - keep:]
+                    return out
+                if i:
+                    out.append(Event("reasoning", self.buf[:i]))
+                self.buf = self.buf[i + len(THINK_END):]
+                self.state, self.lead = "content", True
+            elif self.state == "content":
+                if self.lead:
+                    stripped = self.buf.lstrip("\n")
+                    if not stripped:
+                        self.buf = ""
+                        return out
+                    self.buf, self.lead = stripped, False
+                i = self.buf.find(GLM_CALL_START)
+                if i < 0:
+                    j = len(self.buf) - OutputParser._hold(self, self.buf, (GLM_CALL_START,))
+                    while j > 0 and self.buf[j - 1] == "\n":
+                        j -= 1
+                    if j:
+                        out.append(Event("content", self.buf[:j]))
+                        self.buf = self.buf[j:]
+                    return out
+                if i and self.buf[:i].strip():
+                    out.append(Event("content", self.buf[:i].rstrip("\n")))
+                self.buf = self.buf[i + len(GLM_CALL_START):]
+                self.state = "call"
+                self._reset_call()
+            else:
+                end = self.buf.find(GLM_CALL_END)
+                body = self.buf if end < 0 else self.buf[:end]
+                if self.stream_tools:
+                    out.extend(self._scan_call(body, complete=end >= 0))
+                if end < 0:
+                    return out
+                call = parse_glm_tool_call(body, self.schemas.get(self.call_name))
+                if self.call is not None:
+                    call.id = self.call.id
+                if self.stream_tools:
+                    out.append(Event("tool_args", "}", call=call))
+                out.append(Event("tool_call", call=call))
+                self.buf = self.buf[end + len(GLM_CALL_END):]
+                self.state, self.lead = "content", True
+                self._reset_call()
+
+    def finish(self) -> list[Event]:
+        out = []
+        if self.state == "call" and self.stream_tools and self.call is not None:
+            out.extend(self._scan_call(self.buf, complete=False))
+            if self.stream_tools:
+                out.append(Event("tool_args", "}", call=self.call))
+            out.append(Event("tool_call", call=ToolCall(self.call.name, dict(self.call_args), self.call.id)))
+            self.buf = ""
+            self._reset_call()
+        elif self.buf:
+            kind = "reasoning" if self.state == "reasoning" else "content"
+            text = self.buf if self.state != "call" else GLM_CALL_START + self.buf
             out.append(Event(kind, text))
             self.buf = ""
         return out

@@ -1521,6 +1521,8 @@ def main() -> int:
     esp = None
     esp_choice = (a.experimental_speed_projection or "").strip()
     if family in ("qwen", "coder"):                   # the Coder: the same model's residual stream
+        if not esp_choice and not ESP_VECTOR.is_file():
+            esp_choice = "off"                        # a tree without the vector (the GLM fork): nothing to offer
         if not esp_choice:
             say()
             say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")

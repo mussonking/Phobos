@@ -1,220 +1,219 @@
-<h1 align="center">Strata</h1>
+# Phobos
 
-<p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
-one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+**GLM-5.3-Flash on one NVIDIA GPU plus system RAM: a local server for coding agents.**
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
-of a word): faster than you can read.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Base model](https://img.shields.io/badge/base%20model-zai--org%2FGLM--5.3--Flash-orange.svg)](https://huggingface.co/zai-org/GLM-5.3-Flash)
+[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-GLM--5.3--Flash--Phobos--GGUF-yellow.svg)](https://huggingface.co/mussonking/GLM-5.3-Flash-Phobos-GGUF)
 
-- **Free and open source.**
+Phobos runs **GLM-5.3-Flash** (Z.ai's agentic coding model: 288 experts, 8 active per token) at 4 bits on a single
+NVIDIA card and a large amount of system RAM. It serves a web chat and OpenAI / Anthropic compatible endpoints, so
+Claude Code and other agents can use it. Nothing leaves your machine.
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+## Headline numbers
 
----
+One Tesla V100 32 GB (PCIe 3), 2 x Xeon Gold 6252, 376 GB RAM, AVX-512 VNNI path, quiet machine:
 
-## How fast is it?
+| | measured |
+|---|---|
+| reading a long prompt (95 K and 113 K tokens) | **616-626 tokens/s** (113 K tokens in 181 s) |
+| writing at 95-113 K tokens of context | **29-33 tokens/s** |
+| writing, short context | **26 tokens/s** |
+| first token of a follow-up turn (200 new tokens) | **1.1 s** |
+| needle-in-a-haystack at 95 K and 113 K tokens | **6 / 6 found** |
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+- The long-context writing figures come from the needle answers, which are short and predictable: speculative
+  decoding accepts most drafts there. Expect less on free-form writing.
+- Under background load the same long prompts gave 21-25 tokens/s writing.
+- Every figure, and the AVX2 path's, is in [docs/glm-public.md](docs/glm-public.md#how-fast-is-it).
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
-| --- | ---: | ---: | ---: |
-| **Q2_0** | 90 tokens/s | 67 tokens/s | 1,310 tokens/s |
-| **IQ2_XS** | 74 tokens/s | 60 tokens/s | 1,240 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 46 tokens/s | 1,110 tokens/s |
-| **IQ3_S** | 52 tokens/s | 41 tokens/s | 1,070 tokens/s |
-| **Coder** (IQ1_M) | 51 tokens/s | 44 tokens/s | 1,300 tokens/s |
+## What it is
 
-- **Writes answers** = how fast the reply appears (tokens per second).
-- **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a
-  32K-token prompt; a 4K prompt reads at 740-1,000 tokens/s. A 32K prompt takes about 25 seconds with Q2_0.
+GLM-5.3-Flash is a mixture-of-experts model whose experts take ~165 GB at 4 bits: too much for any single consumer
+GPU. Phobos keeps the attention trunk and the most used experts (1353 of them, 17.2 GB on our V100) on the GPU, and
+leaves the other experts in RAM, where the CPU computes them with int8 kernels (AVX-512 VNNI, or AVX2). An adaptive
+tier swaps experts in and out of VRAM as your traffic changes, and the model's own MTP head drafts tokens for
+speculative decoding.
 
-A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
-100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
-[details](docs/DETAILS.md#speed-measured).
+```mermaid
+flowchart LR
+    subgraph GPU["GPU: VRAM"]
+        T["attention trunk<br/>MLA + sparse indexer, linear attention, MTP head"]
+        H["hot experts<br/>the most used, about 11 %"]
+    end
+    subgraph HOST["CPU: system RAM"]
+        C["all other experts<br/>IQ4, int8 kernels (AVX-512 VNNI or AVX2)"]
+    end
+    T -- "token activations" --> C
+    C -- "expert outputs" --> T
+    T --> H
+    H -. "adaptive tier: swaps experts as traffic changes" .- C
+```
 
-Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 5-10 minutes; on the PC above it made the Coder 7% faster).
+## Hardware
 
-**Two or three NVIDIA cards?** Just run `START-HERE.bat`: it lists your cards, says which ones Strata can use, and
-asks whether to share the model across them (recommended when two can). An install made on one card asks once at
-its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
-card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
-pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
-Every card must be an RTX 30 series or newer with 8 GB or more. See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+| | requirement | tested |
+|---|---|---|
+| GPU | NVIDIA, compute capability 8.0+ (RTX 30 / 40 / 50, A-series), 24 GB VRAM or more | **no 24 GB card tested yet** |
+| | Tesla V100 (sm_70), experimental build | yes: the full model, every number above |
+| | | RTX 3080 10 GB (sm_86), WSL2: a mini model only, all 18 checks pass |
+| CPU | AVX2 minimum; AVX-512 VNNI (Xeon Cascade Lake+, AMD Zen 4 / Zen 5) is faster | VNNI and AVX2, on the same Xeon |
+| RAM | 192 GB minimum, 256 GB+ better | 376 GB only |
+| OS | Linux x86-64 | yes |
+| | Windows through WSL2 | being verified (mini model passes) |
+| Disk | ~180 GB free, NVMe | yes |
 
-## Which model should I pick?
+- RAM bandwidth sets the speed: each generated token reads ~3 GB of experts from RAM. A desktop with 2-channel DDR5
+  should write roughly 10-15 tokens/s (projected, not measured).
+- AMD AM4 and Intel LGA1200 boards take 128 GB at most, so they cannot run it. AM5 and LGA1700 / LGA1851 boards
+  with 192 GB can.
+- One GPU only: a second card is not used.
 
-**The size** (the same model, compressed more or less):
+## Quick start
 
-| Model | RAM+VRAM Requirements | Speed | Quality |
-| --- | ---: | --- | --- |
-| **Q2_0** | 37.6 GB | fastest | good |
-| **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+1. **Download** the IQ4 model, the expert profile and the tokenizer (179 GB):
 
-**Will it fit?** Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**,
-the rest onto your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your
-**RAM is at least shard 1 + about 10 GB** for Windows and your other programs. With 64 GB of RAM every size fits
-(IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't
-lower the RAM needed.
+   ```sh
+   pip install -U huggingface_hub
+   hf download mussonking/GLM-5.3-Flash-Phobos-GGUF \
+       --include "GLM-5.3-Flash-Phobos-IQ4.gguf" "expert-profile-agent.strp" "tokenizer/*" \
+       --local-dir /models/glm
+   ```
 
-**The version:**
+2. **Build** the engine. You need the CUDA toolkit 12.x, a C++20 compiler and Python 3.10+.
 
-- **Qwen3.8-Flash-Next** - the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** - ISTA-DASLab's coding
-  version: half of the experts removed, keeping the ones that code, tool use and images need (91% of the full model's
-  SWE-bench Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored like IQ3_S):
-  shard 1 is **29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long prompts
-  the fastest of all. Weaker outside coding.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI
-  that thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-  token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+   ```sh
+   git clone https://github.com/mussonking/Phobos && cd Phobos
+   python3 -m venv .venv && . .venv/bin/activate && pip install jinja2 cmake ninja
+   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+   cmake --build build --target glm_serve
+   ```
 
-Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM. You can add another
-one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./setup.sh --setup`).
+   - `CMAKE_CUDA_ARCHITECTURES` is your card's compute capability without the dot: RTX 30 = 86, RTX 40 = 89,
+     RTX 50 = 120, A100 = 80.
+   - V100: `70` plus `-DSTRATA_EXPERIMENTAL_SM75=ON`.
 
-For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
-It needs an explicit packing conversion and is not an installer menu option.
+3. **Configure**: write `glm.json`.
 
-## Install
+   ```json
+   {
+     "exe": "build/src/glm/glm_serve",
+     "args": ["--gguf", "/models/glm/GLM-5.3-Flash-Phobos-IQ4.gguf",
+              "--profile", "/models/glm/expert-profile-agent.strp",
+              "--ctx", "131072", "--sessions", "2", "--kv-latent", "auto", "--spec", "1",
+              "--prefix-cache-gb", "48"],
+     "tokenizer": "/models/glm/tokenizer",
+     "family": "glm",
+     "model_name": "glm-local",
+     "fit_max_tokens": true,
+     "log": "glm-serve.log"
+   }
+   ```
 
-**You need:** an NVIDIA RTX 30, 40 or 50 card with 12 GB of VRAM or more, enough RAM for the size you pick (above),
-~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
-install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
-App). Everything else - Python, the engine, the model - is set up for you.
+   With 192 GB of RAM, use `"--prefix-cache-gb", "0"`.
 
-A Volta or Turing card (compute capability 7.x: Tesla V100, RTX 20) works experimentally: there is no ready-made
-engine for it, so setup compiles one (with a CUDA 12.x toolkit - CUDA 13 dropped Volta - and, on Linux, a GCC that
-toolkit accepts, e.g. `g++-12` next to a newer default one).
+4. **Start** the server:
 
-**Windows**
+   ```sh
+   STRATA_API_KEY=<a key you choose> .venv/bin/python -m serve.server --engine strata --config glm.json --port 8142
+   ```
 
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-2. Double-click **`START-HERE.bat`**.
-3. Answer a few questions - or just press Enter each time for the recommended choice:
-   - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
-   - **How much context?** How much text it can keep in mind at once (it suggests one for your card)
-   - **Images?** Whether it should also read pictures
-   - **Experimental speed projection?** Off unless you say yes - [read what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first
+   Loading takes a few minutes (~2 min from NVMe on our machine); `curl http://127.0.0.1:8142/health` answers once
+   it is ready.
 
-Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+5. **Chat**: open `http://127.0.0.1:8142/` in a browser. Or point Claude Code at it:
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
-> loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
-> window. The window tells you what it is doing.
+   ```sh
+   export ANTHROPIC_BASE_URL=http://127.0.0.1:8142 ANTHROPIC_API_KEY=<your key>
+   export API_TIMEOUT_MS=3600000 CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
+   claude
+   ```
 
-**Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
-window to stop the model.
+Every option, the endpoints, thinking effort and the prefix cache: [docs/glm-public.md](docs/glm-public.md).
 
-**Updating:** download the new version and unzip it anywhere (or `git pull`), then run `START-HERE.bat` in it. The
-model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy finds them and sets itself up
-the same way - nothing big is downloaded again.
+## Known limits
 
-**Linux:** run `./setup.sh` - same questions, same result.
+- **Untested on 24 GB cards and on desktops.** Every full-model number comes from one V100 server.
+- Greedy decoding only: temperature, top-p, top-k and seed are ignored.
+- One GPU. One request generates at a time; others wait in line.
+- Text only: GLM-5.3-Flash reads images, this engine does not.
+- The AVX2 path's first token is slow on PCIe 3 (12-16 s for a 200-2000-token follow-up), because it uploads the
+  prompt's experts to the GPU.
+- GLM always thinks. A request with no effort gets Max, which can think for minutes: set `reasoning_effort` to
+  `low` or `high`, and a `max_tokens` large enough for the thinking plus the answer.
+- 131072 tokens per conversation is the most we tested.
 
-## Using it
+## Roadmap
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+- **Q3 and an experimental Q2** of the experts, for gaming PCs with 64 GB of RAM, a 16-24 GB GPU and an NVMe drive
+  holding the experts that do not fit in RAM. The measurement is under way; no numbers are promised until they are
+  measured. They will join the IQ4 file in the same
+  [Hugging Face repo](https://huggingface.co/mussonking/GLM-5.3-Flash-Phobos-GGUF).
+- Results on 24 GB cards and desktops, from your reports (below).
 
-- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
-  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Chat in the terminal:** `.venv\Scripts\python chat.py`
-- **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
-  **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.
-- **Thinking:** the model thinks before it answers. Choose **off, low, medium or high** - in the chat page menu, with
-  `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; high is best for hard questions.
-- **Pictures:** in the chat page click **Picture**; in `chat.py` type `/image <path>`; in apps just attach them.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`, then open the
-  address the server window prints; see the [details](docs/DETAILS.md#using-it).
-- **Experimental speed projection (off by default):** an experimental control vector that setup can turn on; it
-  changes how the model answers - read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first.
+## Report a test
 
-**Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute per
-30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
+Tested it on a 3090, a 4090, another 24 GB card, a desktop or WSL2? Open an issue titled
+`test: <GPU> / <CPU> / <RAM>` with:
 
-## Something went wrong?
+1. **Your setup:** GPU and VRAM, CPU model, RAM size and type (channels, speed), OS; for WSL2, the Windows build and
+   the RAM given to WSL.
+2. **`/health`:** the JSON from `curl http://127.0.0.1:8142/health` once the server is ready. It has `cpu_isa` (the
+   CPU kernel path: `vnni`, `avx2` or `scalar`), `kernels`, `arena` and `slots` (experts in VRAM).
+3. **The engine log** (the file named by `"log"` in your config): CPU threads, VRAM slots, load time, and one timing
+   line per request.
+4. **The needle results:** 6 long prompts (95 K and 113 K tokens) with a code word hidden in each, ~20 min:
 
-**My PC froze, or got very slow, the first time Strata started.**
-That's normal while it starts, most of all the first time. Strata loads 35-55 GB into your RAM, locks part of it for
-the graphics card, and works out how much of the model fits on your GPU. The mouse can freeze for a few minutes. **Wait, and don't close the
-window.** The next starts are much faster. Still frozen after 10 minutes? Restart the PC, close other programs
-(browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
+   ```sh
+   hf download mussonking/GLM-5.3-Flash-Phobos-GGUF --include "needles/*" --local-dir /models/glm
+   .venv/bin/python tools/glm/needle_http.py /models/glm/needles --url http://127.0.0.1:8142 --key-file <file with your key>
+   ```
 
-**It stopped while downloading or installing.**
-Run `START-HERE.bat` again. It continues where it stopped.
-
-**It says the NVIDIA driver is too old.**
-Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the PC, and run
-`START-HERE.bat` again.
-
-**It says port 8080 is already in use.**
-Strata is already running. Look for its window.
-
-**It's very slow and the disk light keeps blinking.**
-Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
-
-**An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
-engine by itself. If it keeps happening, close other programs or pick a smaller size.
-
-**It says the prompt exceeds the context.**
-The conversation is longer than the context you chose. Start a new chat, or run `SETUP.bat` and pick more
-context.
-
-**Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and
-attach `strata-<model>.log` from the Strata folder.
-
-## How does it work?
-
-Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - the same idea as a kitchen, where the
-things you use all the time stay on the counter and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts"),** and each word it writes needs only 10 of them.
-  So it doesn't have to have all of them on the graphics card at once.
-- **Your graphics card** does the part of the work needed for every word, and keeps the few thousand experts that
-  are asked most often. It keeps learning which ones those are while you use it.
-- **Your RAM** holds every expert. When a word needs one the card doesn't have, **your processor** works on it -
-  at the same time as the graphics card, so neither waits for the other.
-- **Your SSD** holds a big lookup table; the model only reads a few small rows of it per word.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check.** A small, fast helper built into the model guesses the next few words, and the big model
-  checks all the guesses in one go. It keeps the ones it agrees with and writes the next word itself - so one step
-  often produces several words. The helper only guesses - the big model decides every word - so you get the same
-  quality answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens - pieces of words - at a time), which is why a long
-  document or code base is read at over 1,000 tokens per second.
-
-Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every part and its numbers, and the
-[paper](docs/paper/Strata-Paper.pdf) tells the whole story, with the measurements behind it.
+   Paste its output: `FOUND` or `missed` per prompt, and the final `N/6 found` line.
+5. **If it failed:** the last 50 lines of the engine log and of the server output.
 
 ## Credits
 
-- Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
-  [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
-  to the model files.
-- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
-  [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
+Phobos stands on other people's work:
+
+- **[Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash)**: GLM-5.3-Flash, its weights, tokenizer and chat template
+  (MIT, Copyright (c) 2026 Z.AI Co., Ltd). GLM-5 technical report: [arXiv:2602.15763](https://arxiv.org/abs/2602.15763).
+- **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 and the Strata contributors (MIT): the project this
+  repository forks. Its server, web app, tokenizer tools and build system are the base Phobos runs on; upstream's own
+  README and credits are in [docs/STRATA-README.md](docs/STRATA-README.md) and
+  [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
+- **[unsloth](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)**: the BF16 GGUF conversion our IQ4 file was
+  quantized from, and the importance matrix used to quantize it (MIT).
+- **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** and their authors (MIT):
+  - the IQ4_XS / IQ4_NL formats and their codebooks, reused in our GPU and CPU expert kernels
+    (`third_party/ggml/LICENSE`), and the Q8_K rounding our CPU kernels reproduce;
+  - `llama-quantize`, which made the GGUF, and `llama-imatrix`, which measured our expert profile;
+  - the `glm5-next` model implementation, the reference our forward pass was written from and checked against
+    ([docs/glm5next-spec.md](docs/glm5next-spec.md)); the MTP draft head follows llama.cpp PR #27917;
+  - ggml's reference kernels, which our kernel parity tests compare against.
+- **The research behind GLM-5.3-Flash's architecture**, which this engine implements:
+  - Multi-head Latent Attention: DeepSeek-V2, [arXiv:2405.04434](https://arxiv.org/abs/2405.04434);
+  - DeepSeek Sparse Attention and its lightning indexer: DeepSeek-V3.2,
+    [arXiv:2512.02556](https://arxiv.org/abs/2512.02556);
+  - Kimi Delta Attention: Kimi Linear (Moonshot AI), [arXiv:2510.26692](https://arxiv.org/abs/2510.26692), which
+    extends Gated DeltaNet, [arXiv:2412.06464](https://arxiv.org/abs/2412.06464);
+  - manifold-constrained hyper-connections: mHC (DeepSeek), [arXiv:2512.24880](https://arxiv.org/abs/2512.24880),
+    after Hyper-Connections (ByteDance), [arXiv:2409.19606](https://arxiv.org/abs/2409.19606).
+- **NVIDIA CUB** (CUDA toolkit): the radix sort in the prefill path.
+- **Outfit** font in the web app (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
+
+Related work, no code shared:
+
+- [sergqwer/strata-glm](https://github.com/sergqwer/strata-glm): another Strata fork for GLM-5.3-Flash, running the
+  checkpoint's NVFP4 experts on an RTX 5090 with 128 GB RAM and 2 NVMe (15-18 tokens/s per its README; archived).
+- [glm53-flash-offload](https://github.com/sybil-solutions/glm53-flash-offload) by 0xSero: exllamav3 with EXL3
+  3.05 bpw and expert offload, on an RTX 3090 with a 24-core EPYC.
+
+Phobos is not affiliated with or endorsed by Z.ai, unsloth, the llama.cpp authors or Strata's author.
 
 ## License
 
-Strata is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
-(MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
-vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
-models are not part of this repository; each model's own license applies to its files.
+MIT, see [LICENSE](LICENSE): Copyright (c) 2026 Niko1221 and the Strata contributors; Copyright (c) 2026 mussonking
+(GLM-5.3-Flash engine). The model weights on Hugging Face are Z.ai's, under MIT.

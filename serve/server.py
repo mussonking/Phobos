@@ -28,6 +28,7 @@ import codecs
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -42,13 +43,21 @@ from typing import Iterator, Protocol
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+from serve.frontend import (ChatTemplate, Event, GLMOutputParser, OutputParser, anthropic_to_messages,  # noqa: E402
+                            effort_levels, images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
-IM_END = "<|im_end|>"
-IMAGE_PAD = "<|image_pad|>"
+IM_END = "<|im_end|>"                         # Qwen default; MockEngine scripts use this spelling
+IMAGE_PAD = "<|image_pad|>"                  # Qwen default
+FAMILY_DEFAULTS = {
+    "qwen": {"model_name": "qwen3.8-flash-next", "im_end": IM_END, "image_pad": IMAGE_PAD},
+    "glm": {"im_end": "<|user|>", "image_pad": "<|image|>"},
+}
+GLM_STOP_IDS = (154820, 154827, 154829)       # eos, <|user|> eot, <|observation|> eom
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+# INFO keys GET /health repeats when the engine reports them: the expert layout (glm_serve), and sampling=greedy from
+# an engine that ignores temperature / top_p / top_k / seed (the web app then hides its sampling controls)
+HEALTH_INFO = ("arena", "slots", "kernels", "down", "sampling", "cpu_isa")
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -156,8 +165,11 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
+        # its own process group (POSIX): close() can end a wrapper (gpu-run) and the engine it started together,
+        # and a Ctrl+C reaches only this server, which then stops the engine in order
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
+                                     start_new_session=True)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
@@ -169,9 +181,7 @@ class StrataEngine:
             self.info["version"] = None
         for line in self.proc.stdout:
             if line.startswith("INFO "):
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+                self._parse_info(line)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -188,8 +198,16 @@ class StrataEngine:
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
 
+    def _parse_info(self, line):
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+
     def _pump(self):
         for line in self.proc.stdout:
+            if line.startswith("INFO "):                # counters the engine updates between requests (glm_serve
+                self._parse_info(line)                   # --prefix-cache-gb: INFO pc_* after each DONE)
+                continue
             self.lines.put(line)
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         self.lines.put(None)
@@ -223,10 +241,8 @@ class StrataEngine:
 
     def restart(self):
         """Start the engine again (the same command) after it died; the new process has its own line queue."""
-        try:
-            self.proc.kill()
-        except OSError:
-            pass
+        self._signal(KILL)
+        self._gone(10)
         info = dict(self.info)
         self.ended = False
         self.__init__(*self.spawn)
@@ -354,13 +370,50 @@ class StrataEngine:
                         self._parse_done(line)
                         break
 
-    def close(self):
+    def _signal(self, sig):
+        """Signal the engine's process group: the engine, or a wrapper (gpu-run) and the engine it runs."""
         try:
-            self.proc.stdin.write("QUIT\n")
+            if os.name == "nt":
+                self.proc.kill()
+            else:
+                os.killpg(self.proc.pid, sig)
+        except OSError:
+            pass
+
+    def _gone(self, timeout: float) -> bool:
+        """Wait until the engine and everything in its group have exited (its GPU memory is free)."""
+        end = time.time() + timeout
+        while True:
+            if self.proc.poll() is not None:
+                if os.name == "nt":
+                    return True
+                try:
+                    os.killpg(self.proc.pid, 0)
+                except ProcessLookupError:
+                    return True
+                except PermissionError:
+                    pass
+            if time.time() >= end:
+                return False
+            time.sleep(0.05)
+
+    def close(self, quit_s: float = 40, term_s: float = 5):
+        """End the engine and return only once it is gone, so whatever stops this server (stop-glm.sh, systemd, a
+        GPU lock) never hands the card on while the engine still holds it: STOP (a request in flight ends at its next
+        prompt chunk or round), QUIT, then SIGTERM and SIGKILL to its process group. glm_serve's clean exit takes
+        ~22 s (unpinning and freeing its ~165 GB arena of 4 KiB pages), so QUIT gets 40 s: the kill path stays for
+        real hangs. ~55 s at most: under stop-glm.sh's 60 s."""
+        try:
+            self.proc.stdin.write(("STOP\n" if self.can_stop else "") + "QUIT\n")
             self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+        except (OSError, ValueError):
+            pass
+        if self._gone(quit_s):
+            return
+        self._signal(signal.SIGTERM)
+        if not self._gone(term_s):
+            self._signal(KILL)
+            self._gone(10)
 
 
 class Vision:
@@ -540,8 +593,11 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, family: str = "qwen"):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.family = family
+        self.im_end = FAMILY_DEFAULTS[family]["im_end"]
+        self.image_pad = FAMILY_DEFAULTS[family]["image_pad"]
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
@@ -556,8 +612,8 @@ class Service:
                        "prompt_ms": 0.0, "decode_ms": 0.0}
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = set(GLM_STOP_IDS) if family == "glm" else set(
+            tokenizer.encode(self.im_end, parse_special=True) + tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -651,7 +707,7 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            pad = self.tok.encode(self.image_pad, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -684,7 +740,10 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        # GLM's template always opens a <think> block; it has no enable_thinking=false branch, so parse its
+        # generation as reasoning even when a client sent the Qwen-only switch.
+        thinking = self.family == "glm" or kwargs.get("enable_thinking", True) is not False
+        return ids, thinking, max_new
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -727,8 +786,10 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser_type = GLMOutputParser if self.family == "glm" else OutputParser
+        parser = parser_type(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        think_n = None                                  # tokens before the first answer / tool call text (the thinking)
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
         with self.status_lock:
@@ -763,6 +824,8 @@ class Service:
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
+                        if think_n is None and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                            think_n = n - 1
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -804,7 +867,8 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate, "thinking_tokens": n if think_n is None else think_n,
+                        "effort": effort_asked(sampling), "max_tokens": max_new})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -817,14 +881,34 @@ class Service:
                     ft = self.status.get("first_token")
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                    th = n if think_n is None else think_n
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                          f"({finish}, cancel={cancel.is_set()}){hit_msg} | thinking {th} answer {n - th} "
+                          f"effort {effort_asked(sampling)} max_tokens {max_new}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n}
+
+
+def effort_asked(req) -> str:
+    """The reasoning effort a request named, in any API's spelling, for the done line: "default" = none (the
+    template's own: Max on GLM), "budget:N" = an Anthropic thinking budget, "off" = thinking disabled."""
+    req = req if isinstance(req, dict) else {}
+    ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+    reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+    output = req.get("output_config") if isinstance(req.get("output_config"), dict) else {}
+    thinking = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
+    if thinking.get("type") == "disabled" or ctk.get("enable_thinking") is False:
+        return "off"
+    effort = req.get("reasoning_effort") or reasoning.get("effort") or output.get("effort") or ctk.get("reasoning_effort")
+    if effort:
+        return str(effort)
+    if thinking.get("budget_tokens") is not None:
+        return f"budget:{thinking['budget_tokens']}"
+    return "default"
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -1183,8 +1267,17 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
+                # the expert layout the engine reports (glm_serve's INFO arena / slots / kernels / down), its CPU
+                # kernel path (cpu_isa: vnni | avx2 | scalar, the one selected; kernels reads f32 on AVX2), its sampling,
+                # and the thinking levels of the model's template when they are not the client's default list
+                info = getattr(svc.engine, "info", {}) or {}
+                efforts = effort_levels(svc.family)
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
+                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 **{k: info[k] for k in HEALTH_INFO if k in info},
+                                 **({"reasoning_efforts": efforts} if efforts else {}),
+                                 **({"prefix_cache": {k[3:]: v for k, v in info.items() if k.startswith("pc_")}}
+                                    if "pc_cap_mb" in info else {})})
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)
@@ -1257,7 +1350,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, family=svc.family)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -1297,7 +1390,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req)
+            messages, tools, kw = anthropic_to_messages(req, family=svc.family)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -1369,7 +1462,9 @@ def lan_addresses() -> list[str]:
             ips.add(info[4][0])
     except OSError:
         pass
-    ok = lambda ip: ip and not ip.startswith(("127.", "169.254.", "0."))
+    def ok(ip):
+        return ip and not ip.startswith(("127.", "169.254.", "0."))
+
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
@@ -1478,10 +1573,28 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+KILL = getattr(signal, "SIGKILL", signal.SIGTERM)      # Windows has no SIGKILL (and kills with TerminateProcess)
+
+
+def wait_for_stop():
+    """Block until Ctrl+C, SIGTERM (kill, systemd, stop scripts) or SIGHUP (the terminal closed): the caller then
+    stops the engine in order. Without the handlers SIGTERM / SIGHUP ended this process on the spot and the engine,
+    on its own, exited later."""
+    stop = threading.Event()
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: stop.set())
+    try:
+        while not stop.wait(1):
+            pass
+    except KeyboardInterrupt:
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
-    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
+    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name, family), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
@@ -1517,6 +1630,10 @@ def main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
+    tokenizer_cfg = {}
+    tokenizer_config_path = tpath / "tokenizer.json"
+    if tokenizer_config_path.exists():
+        tokenizer_cfg = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
@@ -1527,7 +1644,11 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        tok = ST.Tokenizer(tokens, merges, types, pre=tokenizer_cfg.get("pre", "qwen35"),
+                           special_ids=tokenizer_cfg.get("special_ids"))
+    family = str(cfg.get("family") or ("glm" if tokenizer_cfg.get("pre") in ("glm4", "glm5") else "qwen")).lower()
+    if family not in FAMILY_DEFAULTS:
+        ap.error(f"unknown model family {family!r}; supported: {', '.join(FAMILY_DEFAULTS)}")
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -1550,12 +1671,14 @@ def main() -> int:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
+    # the model's own template (exported with its tokenizer), else that family's fallback
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+    fallback_name = "glm_chat_template.jinja" if family == "glm" else "chat_template.jinja"
+    fallback_model = tpath.name if family == "glm" else FAMILY_DEFAULTS["qwen"]["model_name"]
+    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve" / fallback_name),
+                  model_name=cfg.get("model_name") or fallback_model, vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True, family=family)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
@@ -1599,16 +1722,15 @@ def main() -> int:
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
-    try:
-        threading.Event().wait()
-    except KeyboardInterrupt:
-        httpd.shutdown()
-        if hasattr(engine, "close"):
-            engine.close()
-        if vision:
-            vision.close()
-        if hub is not None:
-            hub.close()
+    wait_for_stop()
+    print("[strata] stopping ...", flush=True)
+    httpd.shutdown()
+    if hasattr(engine, "close"):
+        engine.close()                                  # returns once the engine is gone
+    if vision:
+        vision.close()
+    if hub is not None:
+        hub.close()
     return 0
 
 

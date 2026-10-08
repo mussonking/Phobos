@@ -1,10 +1,10 @@
 """tools/strata_tokenizer.py - the tokenizer, as the reference implementation of record.
 
-WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
-= `gpt2`, 248,320 `tokens`, 247,587 `merges`, `token_type`, `pre` = `qwen35`, and a Jinja `chat_template`.
-None of that needs the 35 GB of weights, so it is extracted into the pack's `tokenizer/` directory
-(docs/pack-format.md §6) and this module is what reads it back.  A C++ port follows and is tested against
-this one.
+WHY THIS EXISTS AND WHERE IT SITS. GGUF metadata carries the complete byte-level BPE tokenizer, including its
+pre-tokenizer type and Jinja `chat_template`. The Qwen pack has 248,320 tokens and pre-type `qwen35`; the GLM pack
+has 154,880 tokens and pre-type `glm4`. Neither needs the model weights during extraction, so tokenizer files are
+written into the pack's `tokenizer/` directory (docs/pack-format.md §6) and this module reads them back. A C++ port
+follows and is tested against this one.
 
 THE DECISIVE PROPERTY IS THE ROUND TRIP.  Byte-level BPE maps each BYTE to a printable unicode character so
 that any UTF-8 input is representable with no UNK token.  Every failure mode of that mapping - the wrong
@@ -18,8 +18,13 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import threading
+from collections import OrderedDict
 
 import regex
+
+MEMO_MIN_CHARS = 256          # segments shorter than this are encoded again (a dict entry costs more than they do)
+MEMO_MAX_CHARS = 4_000_000    # memo budget: ~1M tokens, the text of a few full 131K-token conversations
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
@@ -53,6 +58,10 @@ UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
 # Writing the QWEN3 pattern for `qwen35` looks right, round-trips perfectly, and is wrong: a combining mark
 # is `\p{M}`, so without it the mark gets swallowed into the following punctuation run and a token like `_j`
 # never forms.  It cost 3 strings out of 1875 and only `tokenize_oracle_check` could see it.
+#
+# GLM's `glm4` / `glm5` pre types both map to llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (llama.cpp-mtp
+# src/llama-vocab.cpp), transcribed the same way; tools/test_glm_tokenizer_parity.py checks it against
+# llama-tokenize.
 QWEN35_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
     r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
@@ -62,6 +71,23 @@ QWEN35_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
+
+GLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+PRE_PATTERNS = {"qwen35": QWEN35_PATTERN, "glm4": GLM4_PATTERN, "glm5": GLM4_PATTERN}
+PRE_PATTERN_SOURCES = {
+    "qwen35": ".ref/llama.cpp src/llama-vocab.cpp: LLAMA_VOCAB_PRE_TYPE_QWEN35",
+    "glm4": "llama.cpp-mtp/src/llama-vocab.cpp: LLAMA_VOCAB_PRE_TYPE_CHATGLM4",
+    "glm5": "llama.cpp-mtp/src/llama-vocab.cpp: LLAMA_VOCAB_PRE_TYPE_CHATGLM4",
+}
 
 
 class Tokenizer:
@@ -86,7 +112,11 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        try:
+            pattern = PRE_PATTERNS[pre]
+        except KeyError:
+            raise ValueError("unsupported GGUF pre-tokenizer %r" % pre) from None
+        self._re = regex.compile(pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -110,6 +140,16 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+
+        # Incremental encoding.  A literal match is a hard boundary: the text between two matches is BPE'd on its
+        # own (`_encode_matching`), so its ids depend on that text alone.  A chat server re-encodes the whole
+        # conversation every turn, and every segment but the new turn's is one it has already seen; those come
+        # from this memo (least recently used first out, bounded by characters) instead of the regex + BPE pass
+        # (GLM, 30K tokens: 110 ms a turn).  Same ids by construction: the memo stores what `_encode_plain`
+        # returned for that exact string.  Short segments (role tags, separators) are cheaper to encode again.
+        self._memo: OrderedDict[str, list[int]] = OrderedDict()
+        self._memo_chars = 0
+        self._memo_lock = threading.Lock()
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -174,17 +214,36 @@ class Tokenizer:
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.
         """
         if pat is None:
-            return self._encode_plain(text)
+            return list(self._encode_segment(text))
         out: list[int] = []
         pos = 0
         for m in pat.finditer(text):
             if m.start() > pos:
-                out.extend(self._encode_plain(text[pos:m.start()]))
+                out.extend(self._encode_segment(text[pos:m.start()]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
         if pos < len(text):
-            out.extend(self._encode_plain(text[pos:]))
+            out.extend(self._encode_segment(text[pos:]))
         return out
+
+    def _encode_segment(self, text: str) -> list[int]:
+        """`_encode_plain` through the memo (see `__init__`).  The returned list is shared: callers only read it."""
+        if len(text) < MEMO_MIN_CHARS:
+            return self._encode_plain(text)
+        with self._memo_lock:
+            ids = self._memo.get(text)
+            if ids is not None:
+                self._memo.move_to_end(text)
+                return ids
+        ids = self._encode_plain(text)
+        with self._memo_lock:
+            if text not in self._memo and len(text) <= MEMO_MAX_CHARS:
+                self._memo[text] = ids
+                self._memo_chars += len(text)
+                while self._memo_chars > MEMO_MAX_CHARS:
+                    old, _ = self._memo.popitem(last=False)
+                    self._memo_chars -= len(old)
+        return ids
 
     def encode(self, text: str, parse_special: bool = False) -> list[int]:
         """Tokenize `text`.
@@ -228,9 +287,9 @@ def extract(gguf_path, out_dir) -> dict:
         "special_ids": tk.special_ids,
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        # declared `pre` type, and a C++ port that re-derived it could silently change token ids.
+        "pre_pattern": PRE_PATTERNS[tk.pre],
+        "pre_pattern_source": PRE_PATTERN_SOURCES[tk.pre],
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

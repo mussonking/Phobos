@@ -102,9 +102,26 @@ async function loadHealth() {
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    applyEngine();
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
+}
+// what the engine and its model support (GET /health): the thinking levels of the model's template
+// (reasoning_efforts; absent = the page's Off / Low / Medium / High), and sampling=greedy (an engine that always takes
+// the most likely token: no temperature, top-p, top-k or seed to set)
+const greedy = () => health.sampling === "greedy";
+function applyEngine() {
+  const ef = health.reasoning_efforts;
+  if (ef && Array.isArray(ef.levels) && ef.levels.length) {
+    const label = (v) => v.charAt(0).toUpperCase() + v.slice(1);
+    $("s-thinking").innerHTML = ef.levels.map((v) => `<button type="button" role="radio" data-v="${esc(v)}">${esc(label(v))}</button>`).join("");
+    DEFAULTS.thinking = ef.levels.includes(ef.default) ? ef.default : ef.levels[ef.levels.length - 1];
+    const chosen = store.get("sampling", {}).thinking;   // a level applied in this browser, else the model's default
+    settings.thinking = ef.levels.includes(chosen) ? chosen : DEFAULTS.thinking;
+  }
+  for (const id of ["f-temp", "f-topp", "f-topk", "f-seed"]) $(id).hidden = greedy();
+  $("greedy-note").hidden = !greedy();
 }
 
 // ------------------------------------------------------------------ Monitor
@@ -319,13 +336,15 @@ function projectionText(c) {
 }
 function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const drafts = Math.max(0, (eng.mtp_max || eng.spec) - 1);
   facts($("facts-engine"), [
     ["Model", eng.model],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
-    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+    ["CPU kernels", eng.cpu_isa ? ({vnni: "AVX-512 VNNI", avx2: "AVX2", scalar: "scalar (reference, slow)"}[eng.cpu_isa] || eng.cpu_isa) : null],
+    ["Speculation", eng.spec ? `MTP drafts up to ${drafts} token${drafts === 1 ? "" : "s"}${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
@@ -672,12 +691,14 @@ async function send() {
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
                 reasoning_effort: settings.thinking};
-  if (settings.temperature > 0) {
-    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
-  } else {
-    body.temperature = 0;
+  if (!greedy()) {
+    if (settings.temperature > 0) {
+      Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
+    } else {
+      body.temperature = 0;
+    }
+    if (settings.seed) body.seed = +settings.seed;
   }
-  if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
@@ -893,9 +914,12 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
-  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
-  if (s.seed) d.seed = +s.seed;
+  const d = {reasoning_effort: s.thinking};
+  if (!greedy()) {                                      // a greedy engine: no sampling defaults to pretend to set
+    d.temperature = +s.temperature;
+    if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
+    if (s.seed) d.seed = +s.seed;
+  }
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
   return d;
@@ -921,10 +945,16 @@ function outputs() {
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
+  const what = {none: "answers right away", low: "short", medium: "medium", high: "thorough", max: "longest"};
+  $("o-thinking").textContent = sel ? `${what[sel.dataset.v] || ""}${sel.dataset.v === DEFAULTS.thinking ? " (default)" : ""}` : "";
   for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+$("s-thinking").onclick = (e) => {                     // its buttons can come from /health: one handler on the group
+  const b = e.target.closest("[data-v]");
+  if (!b) return;
+  for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b));
+  outputs();
+};
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
@@ -933,7 +963,7 @@ $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($(
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: sel ? sel.dataset.v : DEFAULTS.thinking, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
@@ -951,7 +981,7 @@ $("s-apply").onclick = async () => {
     }
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+  toast("success", "Sampling saved", greedy() || settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);

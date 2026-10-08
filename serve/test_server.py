@@ -305,6 +305,88 @@ class DyingEngine(MockEngine):
             yield t
 
 
+# a stand-in engine for the shutdown tests: READY, then QUIT (or EOF) ends it after a slow teardown (glm_serve unpins
+# its prefix cache); "deaf" ignores QUIT, EOF and SIGTERM. Its pid goes to argv[2].
+FAKE_ENGINE = """import os, signal, sys, time
+mode, pidfile = sys.argv[2], sys.argv[3]
+open(pidfile, "w").write(str(os.getpid()))
+if mode == "deaf":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if line.strip() == "QUIT" and mode != "deaf":
+        break
+while mode == "deaf":
+    time.sleep(1)
+time.sleep(1)
+"""
+
+
+@unittest.skipIf(os.name == "nt", "process groups and signals: POSIX")
+class EngineShutdown(unittest.TestCase):
+    """Stopping the server stops its engine first: close() returns only once the engine and a wrapper that runs it
+    as a child (gpu-run) are gone, so a stop script or a GPU lock never hands the card on while it is still held;
+    SIGTERM to the server goes through that same path (it used to end the server alone, the engine exiting later)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.dir = Path(tempfile.mkdtemp())
+        (cls.dir / "engine.py").write_text(FAKE_ENGINE)
+        wrapper = cls.dir / "wrapper.sh"            # like gpu-run: a shell that runs the engine as its child
+        wrapper.write_text(f'#!/bin/bash\ntrap "exit 143" TERM\n"{sys.executable}" "{cls.dir}/engine.py" "$@"\n')
+        wrapper.chmod(0o755)
+        cls.wrapper = str(wrapper)
+
+    def start(self, mode):
+        pidfile = self.dir / f"{mode}.pid"
+        e = StrataEngine(self.wrapper, [mode, str(pidfile)])
+        return e, int(pidfile.read_text())
+
+    def gone(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    def test_close_waits_for_the_engine(self):
+        import time
+        e, pid = self.start("quits")
+        t0 = time.time()
+        e.close()
+        self.assertGreaterEqual(time.time() - t0, 0.9)  # it waited out the teardown
+        self.assertTrue(self.gone(pid))
+
+    def test_close_kills_an_engine_that_will_not_quit(self):
+        import time
+        e, pid = self.start("deaf")
+        t0 = time.time()
+        e.close(quit_s=0.5, term_s=0.5)
+        self.assertLess(time.time() - t0, 5)
+        self.assertTrue(self.gone(pid))               # the engine, not only its wrapper
+
+    def test_sigterm_stops_the_engine_first(self):
+        import signal
+        import subprocess
+        pidfile = self.dir / "term.pid"
+        code = (f"import sys; sys.path.insert(0, {str(ROOT)!r})\n"
+                "from serve.server import StrataEngine, wait_for_stop\n"
+                f"e = StrataEngine({self.wrapper!r}, ['quits', {str(pidfile)!r}])\n"
+                "print('up', flush=True)\n"
+                "wait_for_stop()\n"
+                "e.close()\n"
+                "print('closed', flush=True)\n")
+        server = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(server.stdout.readline().strip(), "up")
+        pid = int(pidfile.read_text())
+        server.send_signal(signal.SIGTERM)
+        self.assertEqual(server.stdout.readline().strip(), "closed")
+        self.assertEqual(server.wait(timeout=30), 0)
+        server.stdout.close()
+        self.assertTrue(self.gone(pid))
+
+
 class EngineDeath(unittest.TestCase):
     """Issue #27: a dead engine is an error (not "length"), and the next request starts it again."""
 
@@ -515,6 +597,70 @@ class WebApp(unittest.TestCase):
         self.assertEqual(m["engine"]["max_context"], CTX)
         self.assertEqual(m["live"]["state"], "idle")
         self.assertEqual(m["requests"][0]["output_tokens"], 5)
+
+    def test_health_repeats_the_expert_layout(self):
+        self.assertNotIn("arena", json.loads(self.get("/health")[2]))   # an engine that reports none: unchanged
+        self.svc.engine.info = {"arena": "r8", "slots": 1353, "kernels": "vnni", "down": "q8_0", "spec_k": 1,
+                                "cpu_isa": "avx2"}
+        try:
+            h = json.loads(self.get("/health")[2])
+        finally:
+            del self.svc.engine.info
+        self.assertEqual((h["arena"], h["slots"], h["kernels"], h["down"]), ("r8", 1353, "vnni", "q8_0"))
+        self.assertEqual(h["cpu_isa"], "avx2")   # the CPU path selected, told apart from kernels (a community box)
+        self.assertEqual(h["max_context"], CTX)
+        self.assertNotIn("spec_k", h)
+
+    def test_health_reasoning_efforts(self):
+        """GLM's template has Low / High / Max (no off): /health lists them for the web app's Thinking buttons, High
+        selected by default; a family without a list (Qwen) gets none, so its page keeps Off / Low / Medium / High.
+        A request without an effort still gets the template's default (Max)."""
+        self.assertNotIn("reasoning_efforts", json.loads(self.get("/health")[2]))
+        self.svc.family = "glm"
+        try:
+            ef = json.loads(self.get("/health")[2])["reasoning_efforts"]
+        finally:
+            self.svc.family = "qwen"
+        self.assertEqual(ef, {"levels": ["low", "high", "max"], "default": "high"})
+        from serve.frontend import effort_kwargs, openai_to_messages
+        self.assertEqual(openai_to_messages({"messages": [{"role": "user", "content": "hi"}]}, "glm")[2], {})
+        self.assertEqual([effort_kwargs(v, "glm") for v in ef["levels"]],
+                         [{"reasoning_effort": "low"}, {"reasoning_effort": "high"}, {}])   # {} = the template's Max
+
+    def test_request_log_splits_thinking(self):
+        """Each request's record (and its done line) says how many tokens went to thinking vs the answer, the effort
+        the client named and its max_tokens: what deciding the API's default effort needs from real traffic."""
+        import contextlib
+        import io
+        from serve.server import effort_asked
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for effort in ("low", None):
+                body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 40}
+                if effort:
+                    body["reasoning_effort"] = effort
+                urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions",
+                                                              data=json.dumps(body).encode(),
+                                                              headers={"Content-Type": "application/json"}),
+                                       timeout=10).read()
+        reqs = json.loads(self.get("/metrics")[2])["requests"]
+        default, low = reqs[0], reqs[1]                         # newest first
+        self.assertEqual(len("</think>\n\n"), low["thinking_tokens"])   # the mock: "</think>\n\nhello", 1 token/byte
+        self.assertEqual((low["effort"], default["effort"], low["max_tokens"]), ("low", "default", 40))
+        self.assertIn(f"thinking 10 answer {low['output_tokens'] - 10} effort low max_tokens 40", out.getvalue())
+        self.assertEqual(effort_asked({"thinking": {"type": "enabled", "budget_tokens": 4096}}), "budget:4096")
+        self.assertEqual(effort_asked({"thinking": {"type": "disabled"}}), "off")
+        self.assertEqual(effort_asked({"output_config": {"effort": "high"}}), "high")
+
+    def test_health_sampling(self):
+        """An engine that reports sampling=greedy (glm_serve) says so in /health: the web app hides its sampling
+        controls instead of pretending they work."""
+        self.assertNotIn("sampling", json.loads(self.get("/health")[2]))
+        self.svc.engine.info = {"sampling": "greedy"}
+        try:
+            self.assertEqual(json.loads(self.get("/health")[2])["sampling"], "greedy")
+        finally:
+            del self.svc.engine.info
 
     def test_metrics_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"

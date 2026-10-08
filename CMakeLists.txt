@@ -602,6 +602,11 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 endif()
 
+# GLM-5.3-Flash engine (separate from the Qwen engine above).
+if(STRATA_ENABLE_CUDA)
+  add_subdirectory(src/glm)
+endif()
+
 if(STRATA_BUILD_TESTS)
   enable_testing()
   # the unit tests above build from src/; the tests/ tree (model-level checks) is not part of the published repo

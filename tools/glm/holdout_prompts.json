@@ -1,0 +1,49 @@
+{
+  "format": "strata-glm-holdout-v1",
+  "purpose": "Greedy same-GGUF VNNI versus F32 comparison; never use these prompts to train the routing-cache profile.",
+  "temperature": 0,
+  "max_new_tokens": 64,
+  "tokenization": "Use the final tested GGUF vocabulary and the same chat template/BOS policy for both paths. Record the GGUF, template, token IDs and stop policy.",
+  "prompts": [
+    {
+      "id": "fr-qc-plan",
+      "category": "fr-qc",
+      "text": "Reponds en francais quebecois, en trois points courts. Notre equipe doit preparer une petite demo vendredi. Il reste une correction a verifier, un document a relire et une repetition de dix minutes. Propose un ordre de travail prudent, sans inventer de personnes ni de dates."
+    },
+    {
+      "id": "fr-qc-schedule",
+      "category": "fr-qc",
+      "text": "Reponds en francais quebecois, en deux phrases. Une rencontre commence a 14 h 20. Il faut 25 minutes de trajet et on veut arriver 10 minutes avant. A quelle heure doit-on partir? Explique le calcul sans ajouter d'autres contraintes."
+    },
+    {
+      "id": "code-python",
+      "category": "code-review",
+      "text": "Review this Python function. State the root cause and one small fix, in at most three sentences.\n\ndef add_item(item, items=[]):\n    items.append(item)\n    return items\n\nThe caller invokes add_item('a') and then add_item('b') expecting independent lists."
+    },
+    {
+      "id": "code-sql",
+      "category": "code-review",
+      "text": "Explain the bug and show a corrected SQL query, briefly. We need every project, including projects with no open task.\nSELECT p.id, COUNT(t.id) AS open_count\nFROM projects p LEFT JOIN tasks t ON t.project_id = p.id\nWHERE t.status = 'open'\nGROUP BY p.id;"
+    },
+    {
+      "id": "json-fr-order",
+      "category": "json-extraction",
+      "text": "Retourne seulement un objet JSON avec les cles article, quantite, devise et livraison. N'invente rien; une valeur absente doit etre null. Donnees fictives: une commande contient trois cahiers, factures en CAD. Aucune date de livraison n'est mentionnee."
+    },
+    {
+      "id": "json-en-status",
+      "category": "json-extraction",
+      "text": "Return only JSON with keys environment, succeeded, failed and unknown. Use only explicit facts; do not infer missing results. Fictional report: environment=staging. Parser and storage checks passed. Export check failed. Search check has not run. Values succeeded, failed and unknown must be arrays of check names."
+    },
+    {
+      "id": "tool-read-only",
+      "category": "mock-tool-use",
+      "text": "Choose exactly one read-only action and explain it in one sentence. Available actions: inspect_log, restart_service, delete_cache. Fictional observation: the latest deployment returns HTTP 500; no log has been inspected. Do not claim that you executed anything."
+    },
+    {
+      "id": "tool-debug-fr",
+      "category": "mock-debug-log",
+      "text": "Voici un journal fictif: 09:00 requete envoyee; 09:00 delai d'attente apres 30 s; 09:01 nouvelle tentative recue avec le meme identifiant; 09:01 operation appliquee deux fois. En francais, nomme la cause probable et une verification en lecture seule. Ne propose pas de supprimer des donnees et ne pretends pas avoir execute une commande."
+    }
+  ]
+}
